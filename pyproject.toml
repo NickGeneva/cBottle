@@ -42,3 +42,6 @@ dev = [
 
 [tool.ruff]
 line-length = 88
+
+[tool.uv.sources]
+earth2grid = { git = "https://github.com/NVlabs/earth2grid.git" }
