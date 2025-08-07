@@ -395,10 +395,11 @@ class CBottle3d:
         bf16=True,
     ):
         """
-
         Args:
 
-            guidance_pixels: pixels of ``self.input_grid``` where the TCs are desired. 0<= guidance_pixels < 12 * nside ^2.
+            guidance_pixels: Either the pixel index of ``self.input_grid``` where the
+                TCs are desired. 0<= guidance_pixels < 12 * nside ^2. Or the enitre HPX
+                tensor already set. If None, no guidance used.
             guidance_scale: float = 0.03,
 
         """
@@ -441,15 +442,14 @@ class CBottle3d:
             labels_when_nan = torch.zeros_like(labels)
             labels_when_nan[:, 0] = 1
 
-            if guidance_pixels is not None:
+            guidance_data = guidance_pixels
+            if guidance_pixels and guidance_pixels.ndims = 1:
                 guidance_data = torch.full(
                     (batch_size, 1, 1, *self.classifier_grid.shape),
                     torch.nan,
                     device=device,
                 )
                 guidance_data[:, :, :, guidance_pixels] = 1
-            else:
-                guidance_data = None
 
             def D(x_hat, t_hat):
                 if guidance_data is not None:
