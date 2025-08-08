@@ -443,7 +443,7 @@ class CBottle3d:
             labels_when_nan[:, 0] = 1
 
             guidance_data = guidance_pixels
-            if guidance_pixels and guidance_pixels.ndims = 1:
+            if not guidance_pixels is None and guidance_pixels.ndim == 1:
                 guidance_data = torch.full(
                     (batch_size, 1, 1, *self.classifier_grid.shape),
                     torch.nan,
@@ -518,6 +518,8 @@ class CBottle3d:
                     sigma_max=int(
                         self.sigma_max
                     ),  # Convert to int for type compatibility
+                    sigma_min=self.sigma_min,
+                    num_steps=self.num_steps,
                 )
             return self._post_process(out), self.coords
 
