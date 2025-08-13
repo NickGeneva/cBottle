@@ -134,7 +134,7 @@ class CBottle3d:
             # Fallback: try to get grid from domain directly
             grid_obj = self.net.domain
 
-        if info.scales is not None and info.centers is not None:
+        if info.scales is not None and info.center is not None:
             scales = info.scales
             center = info.center
             x = grid_obj.reorder(self.output_grid.pixel_order, x)
