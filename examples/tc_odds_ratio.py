@@ -33,11 +33,7 @@ ds.set_times(times)
 loader = torch.utils.data.DataLoader(ds, batch_size=1)
 batch = next(iter(loader))
 
-CHECKPOINT_ROOT = (
-    "/lustre/fsw/portfolios/coreai/projects/coreai_climate_earth2/pmanshausen/"
-    "project-data/viddiff/training-runs/cbottle_3d_tc_public_layout/"
-)
-model = cbottle.inference.load("cbottle-3d-moe-tc", root=CHECKPOINT_ROOT)
+model = cbottle.inference.load("cbottle-3d-moe-tc")
 guidance_pixels = model.get_guidance_pixels(lons, lats)
 
 # Reduced-cost schedule so the example runs in a few minutes on one GPU.
