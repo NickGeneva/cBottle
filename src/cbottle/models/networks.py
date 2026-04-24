@@ -33,7 +33,7 @@ from earth2grid.healpix import (
     Grid,
     PaddingBackends,
     PixelOrder,
-    # pad_backend,
+    pad_backend,
 )
 from earth2grid.healpix import pad as healpix_pad
 from torch.nn.functional import silu
@@ -511,11 +511,10 @@ class Conv2dHealpix(torch.nn.Module):
         )
         x = x.permute(0, 1, 4, 2, 3)  # channels_last N F C H W
         # TODO: Add torch.compile for indexing backend
-        # commented for preventing graph breaks for demo
-        # if x.is_cuda:
-        #     torch.cuda.set_device(x.device)  # WORK AROUND FOR EARTH2GRID BUG
-        # with pad_backend(self.padding_backend):
-        x = healpix_pad(x, padding)
+        if x.is_cuda:
+            torch.cuda.set_device(x.device)  # WORK AROUND FOR EARTH2GRID BUG
+        with pad_backend(self.padding_backend):
+            x = healpix_pad(x, padding)
         x = x.permute(0, 1, 3, 4, 2)  # N F H W C
         # No transpose reshape
         x = einops.rearrange(x, "(b t) f x y c -> (b t f) x y c", b=B, t=T, f=F, c=C)
