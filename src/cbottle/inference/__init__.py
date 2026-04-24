@@ -40,11 +40,11 @@ from cbottle.diffusion_samplers import (
 )
 from cbottle.datasets import base
 from cbottle.odds_ratio import (
-    ClassifierGuidanceStrategy,
     DivergenceTracker,
     _make_reverse_aware_sampler,
     calculate_divergence_integral,
     calculate_gaussian_logp,
+    classifier_bce_guidance,
     default_sigma_schedule,
 )
 
@@ -841,21 +841,21 @@ class CBottle3d:
                 f"(reverse={reverse}, guidance={compute_guidance})"
             )
             if compute_guidance:
-                strategy = ClassifierGuidanceStrategy()
+                guidance_fn = classifier_bce_guidance
                 guidance_pixels_eff = guidance_pixels
                 scale = guidance_scale
                 tracker_scale = guidance_scale
             else:
-                strategy = None
+                guidance_fn = None
                 guidance_pixels_eff = None
                 scale = 0.0
-                # With no guidance strategy the scale is unused inside the
-                # tracker (it only multiplies a zero vector); pass 0 for
-                # clarity rather than the caller's scale.
+                # With no guidance_fn the scale is unused inside the tracker
+                # (it only multiplies a zero vector); pass 0 for clarity
+                # rather than the caller's scale.
                 tracker_scale = 0.0
 
             tracker = DivergenceTracker(
-                guidance_strategy=strategy,
+                guidance_fn=guidance_fn,
                 guidance_scale=tracker_scale,
                 sigma_max=sigma_max,
                 divergence_samples=divergence_samples,

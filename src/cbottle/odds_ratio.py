@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DivergenceComputer",
     "DivergenceTracker",
-    "ClassifierGuidanceStrategy",
+    "classifier_bce_guidance",
     "calculate_divergence_integral",
     "calculate_gaussian_logp",
     "default_sigma_schedule",
@@ -94,37 +94,35 @@ class DivergenceComputer:
 
 
 # ---------------------------------------------------------------------------
-# Classifier-based guidance strategy
+# Classifier-based guidance gradient
 # ---------------------------------------------------------------------------
 
 
-class ClassifierGuidanceStrategy:
-    """Binary-cross-entropy classifier guidance.
+def classifier_bce_guidance(
+    guidance_data: torch.Tensor, logits: torch.Tensor, x_hat: torch.Tensor
+) -> torch.Tensor:
+    """Raw (unscaled) BCE-classifier guidance gradient ``-dL/dx_hat``.
 
-    Returns the *raw* (unscaled) gradient; the caller is expected to apply
-    the sigma schedule and ``guidance_scale`` scaling.
+    The caller (typically :class:`DivergenceTracker`) applies the sigma
+    schedule and ``guidance_scale``. Returns a zero tensor if the guidance
+    mask is empty.
     """
+    guidance_mask = ~torch.isnan(guidance_data)
+    valid_logits = logits[guidance_mask]
+    valid_targets = guidance_data[guidance_mask]
 
-    def compute_guidance(self, guidance_data, logits, x_hat, denoised, t_hat):
-        guidance_mask = ~torch.isnan(guidance_data)
-        valid_logits = logits[guidance_mask]
-        valid_targets = guidance_data[guidance_mask]
+    if valid_logits.numel() == 0:
+        return torch.zeros_like(x_hat)
 
-        if valid_logits.numel() == 0:
-            return torch.zeros_like(x_hat), {"classifier_norm": 0.0}
+    x_hat.requires_grad_(True)
+    x_hat.grad = None
 
-        x_hat.requires_grad_(True)
-        x_hat.grad = None
-
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            valid_logits, valid_targets, reduction="sum"
-        )
-        classifier_grad = torch.autograd.grad(loss, x_hat, create_graph=True)[0]
-
-        # Negative gradient because we minimise the classifier loss.
-        guidance = -classifier_grad
-        metadata = {"classifier_norm": float(torch.norm(classifier_grad).item())}
-        return guidance, metadata
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        valid_logits, valid_targets, reduction="sum"
+    )
+    classifier_grad = torch.autograd.grad(loss, x_hat, create_graph=True)[0]
+    # Negative gradient because we minimise the classifier loss.
+    return -classifier_grad
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +141,14 @@ class DivergenceTracker:
     """Callable ``guidance_fn`` that records per-step divergence traces.
 
     Installed via ``_sample_with_latents(..., guidance_fn=tracker)``. Pass
-    ``guidance_strategy=None`` for no-guidance mode: the hook still fires so
-    score divergence is tracked, but the returned guidance contribution is zero.
+    ``guidance_fn=None`` for no-guidance mode: the hook still fires so score
+    divergence is tracked, but the returned guidance contribution is zero.
     The ``"forward"`` phase also records ``initial_log_prob`` at step 0.
     """
 
     def __init__(
         self,
-        guidance_strategy: "ClassifierGuidanceStrategy | None" = None,
+        guidance_fn: Callable | None = None,
         *,
         guidance_scale: float = 1.0,
         sigma_max: float = 200.0,
@@ -160,7 +158,7 @@ class DivergenceTracker:
         compute_guidance_div: bool = True,
         sigma_schedule: Callable[[torch.Tensor], float] = default_sigma_schedule,
     ):
-        self.guidance_strategy = guidance_strategy
+        self.guidance_fn = guidance_fn
         self.guidance_scale = guidance_scale
         self.sigma_max = sigma_max
         self.divergence_samples = divergence_samples
@@ -185,13 +183,11 @@ class DivergenceTracker:
 
         sigma_weight = self.sigma_schedule(t_hat)
 
-        # Compute RAW guidance. If strategy is None run in no-guidance mode:
-        # zeros are contributed and guidance divergence is skipped (score
-        # divergence is still tracked below).
-        if self.guidance_strategy is not None:
-            raw_guidance, _ = self.guidance_strategy.compute_guidance(
-                guidance_data, logits, x_hat, denoised, t_hat
-            )
+        # Compute RAW guidance. If guidance_fn is None run in no-guidance
+        # mode: zeros are contributed and guidance divergence is skipped
+        # (score divergence is still tracked below).
+        if self.guidance_fn is not None:
+            raw_guidance = self.guidance_fn(guidance_data, logits, x_hat)
             scaled_guidance = sigma_weight * raw_guidance
             scaled_norm = float(torch.norm(raw_guidance).item() * sigma_weight)
         else:
@@ -208,7 +204,7 @@ class DivergenceTracker:
 
         if (
             self.compute_guidance_div
-            and self.guidance_strategy is not None
+            and self.guidance_fn is not None
             and torch.norm(scaled_guidance) > 0
             and sigma_weight != 0
         ):
