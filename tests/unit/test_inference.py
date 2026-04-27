@@ -191,6 +191,10 @@ class MockClassifier:
     def __init__(self):
         self.is_called = False
 
+    def to(self, device):
+        # No parameters to move; satisfies CBottle3d._move_models_to_device.
+        return self
+
     def __call__(self, x_hat, *args, **kwargs):
         self.is_called = True
         # Use x_hat in the computation so gradients can flow through

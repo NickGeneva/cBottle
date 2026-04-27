@@ -37,11 +37,13 @@ class MockClassifier:
     def __init__(self):
         self.is_called = False
 
+    def to(self, device):
+        # No parameters to move; satisfies CBottle3d._move_models_to_device.
+        return self
+
     def __call__(self, x_hat, *args, **kwargs):
         self.is_called = True
-        logits = (
-            torch.ones(1, 1, 1, 12 * 8**2, requires_grad=True).cuda() * x_hat.mean()
-        )
+        logits = torch.ones(1, 1, 1, 12 * 8**2).cuda() * x_hat.mean()
         return Output(out=None, logits=logits)
 
 
@@ -81,17 +83,18 @@ def _make_batch():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_calculate_odds_ratio_forward_only():
+def test_calculate_odds_ratio_full_forward_only():
+    """run_backward=False populates the forward fields and leaves backward as None."""
     classifier = MockClassifier()
     model = _make_tiny_cbottle3d(classifier)
     batch = _make_batch()
     guidance_pixels = torch.tensor([0]).cuda()
 
-    results = model.calculate_odds_ratio(
+    result = model._calculate_odds_ratio_full(
         batch,
         guidance_pixels,
         num_steps=2,
-        extra_steps_intervals=(),  # no densification at this tiny size
+        extra_steps_intervals=(),
         divergence_samples=1,
         guidance_on=0.0,
         guidance_off=float("inf"),
@@ -99,21 +102,11 @@ def test_calculate_odds_ratio_forward_only():
         bf16=False,
     )
 
-    # Forward-only contract: scalar + tensor keys, no backward fields.
-    assert set(results.keys()) == {
-        "forward_guidance_div_integral",
-        "forward_score_div_integral",
-        "initial_log_prob",
-        "forward_latents",
-    }
-    for k in (
-        "forward_guidance_div_integral",
-        "forward_score_div_integral",
-        "initial_log_prob",
-    ):
-        assert isinstance(results[k], float)
-        assert math.isfinite(results[k])
-    assert results["forward_latents"].shape == batch["target"].shape
+    assert math.isfinite(result.forward_score_div_integral)
+    assert result.forward_latents.shape == batch["target"].shape
+    assert result.backward_gaussian_logp is None
+    with pytest.raises(ValueError):
+        _ = result.log_odds_ratio
     assert classifier.is_called
 
 
@@ -124,7 +117,7 @@ def test_calculate_odds_ratio_full_three_phases():
     batch = _make_batch()
     guidance_pixels = torch.tensor([0]).cuda()
 
-    results = model.calculate_odds_ratio(
+    result = model._calculate_odds_ratio_full(
         batch,
         guidance_pixels,
         num_steps=2,
@@ -136,29 +129,36 @@ def test_calculate_odds_ratio_full_three_phases():
         bf16=False,
     )
 
-    expected_scalar_keys = {
-        "forward_guidance_div_integral",
-        "forward_score_div_integral",
-        "backward_guidance_div_integral",
-        "backward_score_div_integral",
-        "backward_no_guidance_guidance_div_integral",
-        "backward_no_guidance_score_div_integral",
-        "backward_gaussian_logp",
-        "backward_no_guidance_gaussian_logp",
-        "initial_log_prob",
-    }
-    expected_tensor_keys = {
-        "forward_latents",
-        "backward_latents",
-        "backward_no_guidance_latents",
-    }
-    assert set(results.keys()) == expected_scalar_keys | expected_tensor_keys
+    assert math.isfinite(result.forward_score_div_integral)
+    assert math.isfinite(result.log_odds_ratio)
+    assert isinstance(result.backward_latents, torch.Tensor)
 
-    for k in expected_scalar_keys:
-        assert isinstance(results[k], float), k
-        assert math.isfinite(results[k]), k
-    for k in expected_tensor_keys:
-        assert isinstance(results[k], torch.Tensor), k
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_calculate_odds_ratio_simple_wrapper():
+    """The user-visible ``calculate_odds_ratio`` returns ``(float, Tensor)``."""
+    classifier = MockClassifier()
+    model = _make_tiny_cbottle3d(classifier)
+    batch = _make_batch()
+    guidance_pixels = torch.tensor([0]).cuda()
+
+    log_odds_ratio, forward_latents = model.calculate_odds_ratio(
+        batch,
+        guidance_pixels,
+        num_steps=2,
+        extra_steps_intervals=(),
+        divergence_samples=1,
+        guidance_on=0.0,
+        guidance_off=float("inf"),
+        bf16=False,
+    )
+    assert isinstance(log_odds_ratio, float) and math.isfinite(log_odds_ratio)
+    assert forward_latents.shape == batch["target"].shape
+
+    with pytest.raises(ValueError):
+        model.calculate_odds_ratio(
+            batch, guidance_pixels, num_steps=2, run_backward=False
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

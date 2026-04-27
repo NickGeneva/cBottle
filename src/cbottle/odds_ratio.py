@@ -24,9 +24,10 @@ use :mod:`cbottle.likelihood`.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
-from typing import Callable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -35,14 +36,73 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
-    "DivergenceComputer",
     "DivergenceTracker",
-    "classifier_bce_guidance",
+    "OddsRatioResult",
+    "classifier_guidance",
     "calculate_divergence_integral",
     "calculate_gaussian_logp",
     "default_sigma_schedule",
-    "create_custom_time_steps",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class OddsRatioResult:
+    """Return type of :meth:`CBottle3d.calculate_odds_ratio`.
+
+    Forward-phase fields are always populated. Backward-phase fields are
+    ``None`` when ``run_backward=False``. The :attr:`log_odds_ratio` property
+    combines the backward fields into ``log p_unguided / p_guided`` at the
+    target sample.
+    """
+
+    # Forward phase
+    forward_guidance_div_integral: float
+    forward_score_div_integral: float
+    forward_latents: torch.Tensor
+    initial_log_prob: float | None
+
+    # Backward-with-guidance phase
+    backward_guidance_div_integral: float | None = None
+    backward_score_div_integral: float | None = None
+    backward_gaussian_logp: float | None = None
+    backward_latents: torch.Tensor | None = None
+
+    # Backward-without-guidance phase
+    backward_no_guidance_guidance_div_integral: float | None = None
+    backward_no_guidance_score_div_integral: float | None = None
+    backward_no_guidance_gaussian_logp: float | None = None
+    backward_no_guidance_latents: torch.Tensor | None = None
+
+    @property
+    def log_odds_ratio(self) -> float:
+        """``log p_unguided / p_guided`` at the target sample.
+
+        Requires the two backward phases (``run_backward=True``).
+        """
+        if (
+            self.backward_gaussian_logp is None
+            or self.backward_no_guidance_gaussian_logp is None
+            or self.backward_score_div_integral is None
+            or self.backward_no_guidance_score_div_integral is None
+            or self.backward_guidance_div_integral is None
+        ):
+            raise ValueError(
+                "log_odds_ratio requires both backward phases; "
+                "call calculate_odds_ratio with run_backward=True."
+            )
+        return (
+            (self.backward_no_guidance_gaussian_logp - self.backward_gaussian_logp)
+            + (
+                self.backward_no_guidance_score_div_integral
+                - self.backward_score_div_integral
+            )
+            - self.backward_guidance_div_integral
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -50,47 +110,54 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-class DivergenceComputer:
-    """Estimate divergence of a vector field via the Hutchinson trace trick."""
+def _hutchinson_divergence(
+    x_hat: torch.Tensor,
+    vector: torch.Tensor,
+    t_hat: torch.Tensor,
+    num_samples: int = 3,
+) -> float:
+    """Estimate ``div_x (vector)`` via the Hutchinson trace trick.
 
-    @staticmethod
-    def compute_divergence(x_hat, vector, t_hat, num_samples: int = 3) -> float:
-        """Compute ``div_x (vector)`` using ``num_samples`` Rademacher-free probes.
+    Uses ``num_samples`` Gaussian probes with deterministic seeding (a function
+    of ``t_hat``) for reproducibility across calls at the same sigma. Only
+    ``batch_size = 1`` is supported -- larger batches OOM through the
+    second-order autograd path in practice, so the caller (typically
+    :meth:`CBottle3d._calculate_odds_ratio_full`) enforces this upstream.
 
-        Args:
-            x_hat: Input tensor (``requires_grad=True`` is expected).
-            vector: Vector field (same shape as ``x_hat``).
-            t_hat: Current noise level (used purely for deterministic seeding).
-            num_samples: Monte Carlo samples.
-        """
-        if torch.norm(vector) == 0:
-            return 0.0
+    Args:
+        x_hat: Input tensor with ``shape[0] == 1`` and ``requires_grad=True``.
+        vector: Vector field of the same shape as ``x_hat``.
+        t_hat: Current noise level; used only for seeding.
+        num_samples: Monte Carlo probes to average over.
+    """
+    if torch.norm(vector) == 0:
+        return 0.0
 
-        divergence_val = torch.zeros(x_hat.shape[0], device=x_hat.device)
-        dims = list(range(1, x_hat.ndim))
+    divergence_val = torch.zeros(x_hat.shape[0], device=x_hat.device)
+    dims = list(range(1, x_hat.ndim))
 
-        for i in range(num_samples):
-            seed = int(t_hat * 1000) + i
-            generator = torch.Generator(device=x_hat.device).manual_seed(seed)
+    for i in range(num_samples):
+        seed = int(t_hat * 1000) + i
+        generator = torch.Generator(device=x_hat.device).manual_seed(seed)
 
-            e = torch.randn(
-                x_hat.shape,
-                device=x_hat.device,
-                dtype=x_hat.dtype,
-                generator=generator,
-            )
-            gf = torch.sum(vector * e)
-            gf.backward(retain_graph=True)
+        e = torch.randn(
+            x_hat.shape,
+            device=x_hat.device,
+            dtype=x_hat.dtype,
+            generator=generator,
+        )
+        gf = torch.sum(vector * e)
+        gf.backward(retain_graph=True)
 
-            if x_hat.grad is not None:
-                div_sample = torch.sum(x_hat.grad * e, dim=dims)
-                divergence_val += div_sample / num_samples
-                x_hat.grad = None
-                gf = None
-            else:
-                break
+        if x_hat.grad is not None:
+            div_sample = torch.sum(x_hat.grad * e, dim=dims)
+            divergence_val += div_sample / num_samples
+            x_hat.grad = None
+            gf = None
+        else:
+            break
 
-        return float(divergence_val.item())
+    return float(divergence_val.item())
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +165,7 @@ class DivergenceComputer:
 # ---------------------------------------------------------------------------
 
 
-def classifier_bce_guidance(
+def classifier_guidance(
     guidance_data: torch.Tensor, logits: torch.Tensor, x_hat: torch.Tensor
 ) -> torch.Tensor:
     """Raw (unscaled) BCE-classifier guidance gradient ``-dL/dx_hat``.
@@ -167,16 +234,42 @@ class DivergenceTracker:
         self.compute_guidance_div = compute_guidance_div
         self.sigma_schedule = sigma_schedule
 
-        self.divergence_computer = DivergenceComputer()
         self.data: list[dict] = []
         self.initial_log_prob: float | None = None
 
     # -- guidance hook ----------------------------------------------------
-    def __call__(self, guidance_data, logits, x_hat, denoised, t_hat):
+    def __call__(
+        self,
+        guidance_data: torch.Tensor | None,
+        logits: torch.Tensor | None,
+        x_hat: torch.Tensor,
+        denoised: torch.Tensor,
+        t_hat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Record per-step divergence trace and return scaled guidance.
+
+        Shapes (with ``B`` = batch, ``C`` = ``net.img_channels``, ``T`` =
+        ``net.time_length``, ``X`` = number of HPX pixels at the model
+        resolution, ``X_c`` = number of pixels at the classifier resolution):
+
+        - ``guidance_data``: ``(B, 1, 1, X_c)`` (``NaN`` outside guidance
+          mask) or ``None`` in no-guidance mode.
+        - ``logits``: ``(B, 1, 1, X_c)`` from the classifier head, or
+          ``None`` in no-guidance mode.
+        - ``x_hat``: ``(B, C, T, X)``, ``requires_grad=True``.
+        - ``denoised``: ``(B, C, T, X)``.
+        - ``t_hat``: scalar tensor (current sigma).
+
+        Returns ``(B, C, T, X)`` -- the sigma-schedule-scaled guidance vector,
+        detached from the backward graph.
+        """
+        if x_hat.grad is not None:
+            x_hat.grad = None
+
         # Record the initial (step 0) log p(x | N(0, sigma_max^2)) as a scalar
-        # -- only on the forward phase so downstream consumers can combine
-        # with the backward logps.
-        if self.initial_log_prob is None and self.phase == "forward":
+        # on any forward variant ("forward" or "forward_no_guidance") so
+        # downstream consumers can combine with the backward logps.
+        if self.initial_log_prob is None and self.phase.startswith("forward"):
             self.initial_log_prob = calculate_gaussian_logp(
                 x_hat.detach(), self.sigma_max
             )
@@ -213,12 +306,12 @@ class DivergenceTracker:
             # schedule, so dividing by t_hat gives the per-step contribution
             # to the drift whose divergence we want.
             full_guidance = self.guidance_scale / t_hat * scaled_guidance
-            divergence_val = -self.divergence_computer.compute_divergence(
+            divergence_val = -_hutchinson_divergence(
                 x_hat, full_guidance, t_hat, self.divergence_samples
             )
 
         if self.compute_score_div:
-            score_div_val = self.divergence_computer.compute_divergence(
+            score_div_val = _hutchinson_divergence(
                 x_hat, score.clone(), t_hat, self.divergence_samples
             )
 
@@ -291,7 +384,7 @@ def calculate_gaussian_logp(sample: torch.Tensor, sigma: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def create_custom_time_steps(
+def _create_custom_time_steps(
     net,
     device,
     *,
@@ -341,7 +434,7 @@ def _edm_sampler_with_custom_steps(
     S_max: float = float("inf"),
     S_noise: float = 0,
     randn_like=torch.randn_like,
-    progress_desc: str | None = None,
+    progress_wrapper: Callable[[Iterable], Iterable] | None = None,
     # The following are accepted and ignored to satisfy the calling convention
     # used by ``_sample_with_latents``; the schedule is fully specified by
     # ``t_steps`` so they are redundant here. Explicit rather than **kwargs to
@@ -353,16 +446,16 @@ def _edm_sampler_with_custom_steps(
 ):
     """Deterministic EDM sampler honoring an externally provided sigma schedule.
 
-    If ``progress_desc`` is set, wraps the sigma loop in a tqdm bar labelled
-    with that string (useful for per-phase progress inside long
-    :meth:`CBottle3d.calculate_odds_ratio` runs).
+    If ``progress_wrapper`` is set, the per-step iterable is passed through it
+    once before iteration -- typically a tqdm wrapper for live progress, but
+    callers can substitute any iterable-to-iterable transform.
     """
     x_next = latents.to(torch.float64)
-    steps = list(zip(t_steps[:-1], t_steps[1:]))
-    if progress_desc is not None:
-        from tqdm.auto import tqdm
-
-        steps = tqdm(steps, desc=progress_desc, leave=False)
+    steps: Iterable[tuple[torch.Tensor, torch.Tensor]] = list(
+        zip(t_steps[:-1], t_steps[1:])
+    )
+    if progress_wrapper is not None:
+        steps = progress_wrapper(steps)
 
     for t_cur, t_next in steps:
         x_cur = x_next
@@ -390,7 +483,7 @@ def _make_reverse_aware_sampler(
     sigma_max: float = 200.0,
     rho: float = 7.0,
     extra_steps_intervals: Sequence[tuple[float, float, int]] = (),
-    progress_desc: str | None = None,
+    progress_wrapper: Callable[[Iterable], Iterable] | None = None,
 ):
     """Build a sampler closure compatible with ``_sample_with_latents``.
 
@@ -408,7 +501,7 @@ def _make_reverse_aware_sampler(
     _sigma_max = sigma_max
     _rho = rho
     _extra_steps_intervals = extra_steps_intervals
-    _progress_desc = progress_desc
+    _progress_wrapper = progress_wrapper
 
     def _sampler(
         net,
@@ -422,7 +515,7 @@ def _make_reverse_aware_sampler(
         time_stepper=None,
     ):
         device = latents.device
-        t_steps = create_custom_time_steps(
+        t_steps = _create_custom_time_steps(
             net,
             device,
             num_steps=_num_steps,
@@ -446,7 +539,7 @@ def _make_reverse_aware_sampler(
             latents,
             t_steps,
             randn_like=randn_like,
-            progress_desc=_progress_desc,
+            progress_wrapper=_progress_wrapper,
         )
 
     return _sampler

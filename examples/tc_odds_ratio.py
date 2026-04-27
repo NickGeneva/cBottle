@@ -38,7 +38,7 @@ guidance_pixels = model.get_guidance_pixels(lons, lats)
 
 # Reduced-cost schedule so the example runs in a few minutes on one GPU.
 # For paper-accurate numbers drop the overrides; see CBottle3d.calculate_odds_ratio.
-results = model.calculate_odds_ratio(
+log_odds_ratio, forward_latents = model.calculate_odds_ratio(
     batch,
     guidance_pixels,
     num_steps=18,
@@ -48,16 +48,8 @@ results = model.calculate_odds_ratio(
     seed=0,
 )
 
-log_odds_ratio = (
-    (results["backward_no_guidance_gaussian_logp"] - results["backward_gaussian_logp"])
-    + (
-        results["backward_no_guidance_score_div_integral"]
-        - results["backward_score_div_integral"]
-    )
-    - results["backward_guidance_div_integral"]
-)
 print(f"log p_unguided / p_guided  ~  {log_odds_ratio:.2f}")
 
-sample = model._post_process(results["forward_latents"])
+sample = model._post_process(forward_latents)
 visualize(sample[0, 0, 0].detach().cpu(), nest=True, region="carib")
 plt.savefig("tc_odds_ratio_sample.png", bbox_inches="tight", dpi=120)
