@@ -28,7 +28,6 @@ from tqdm.auto import tqdm
 from typing import Callable, Literal, Sequence
 import dataclasses
 import logging
-import warnings
 from scipy.signal.windows import kaiser_bessel_derived
 
 import cbottle.denoiser_factories
@@ -719,9 +718,6 @@ class CBottle3d:
                             raise ValueError(
                                 "Model did not produce `logits`. Are you sure this model was trained with guidance?"
                             )
-                        else:
-                            # use the logits from the main model
-                            pass
                     # If the caller supplied guidance_fn, use it; else fall back to the
                     # module-level get_guidance (still monkey-patchable for back-compat).
                     _gfn = (
@@ -780,24 +776,21 @@ class CBottle3d:
     ) -> tuple[float, torch.Tensor]:
         """Compute classifier-guided ``(log_odds_ratio, forward_latents)``.
 
-        Thin wrapper over :meth:`_calculate_odds_ratio_full`; forwards
-        ``**kwargs`` verbatim. Always runs both backward phases (so that
-        ``log_odds_ratio`` is defined). For per-phase divergence integrals,
-        Gaussian logps, and the backward latents, call
-        :meth:`_calculate_odds_ratio_full` directly.
+        Thin wrapper over :meth:`_calculate_odds_ratio_full`; ``**kwargs`` are
+        forwarded verbatim. The two backward phases always run -- without them
+        ``log_odds_ratio`` is undefined -- so callers who want forward-only
+        mode, the per-phase divergence integrals, the Gaussian logps, or the
+        backward latents should call :meth:`_calculate_odds_ratio_full`
+        directly.
         """
-        kwargs.setdefault("run_backward", True)
-        if not kwargs["run_backward"]:
-            raise ValueError(
-                "calculate_odds_ratio requires run_backward=True; "
-                "use _calculate_odds_ratio_full for forward-only mode."
-            )
-        result = self._calculate_odds_ratio_full(batch, guidance_pixels, **kwargs)
+        result = self._calculate_odds_ratio_full(
+            batch, guidance_pixels, run_backward=True, **kwargs
+        )
         return result.log_odds_ratio, result.forward_latents
 
     def _calculate_odds_ratio_full(
         self,
-        batch: dict,
+        batch: dict[str, torch.Tensor],
         guidance_pixels: torch.Tensor,
         *,
         num_steps: int = 36,
@@ -883,26 +876,12 @@ class CBottle3d:
             sample tensor, and the second-order autograd path through the
             denoiser is GPU-memory-bound -- larger batches OOM in practice.
         """
-        if batch["target"].device != self.device:
-            batch = self._move_to_device(batch)
 
         if batch["target"].shape[0] != 1:
             raise ValueError(
                 f"_calculate_odds_ratio_full only supports batch_size=1; "
                 f"got batch['target'].shape={tuple(batch['target'].shape)}. "
                 f"Loop over batches in the caller."
-            )
-
-        # The custom odds-ratio sampler is Euler-only; the model-level
-        # time_stepper is ignored here. Warn once so callers who built the
-        # model with time_stepper="heun" don't silently get a different
-        # integrator than sample() would use.
-        if self.time_stepper != "euler":
-            warnings.warn(
-                f"calculate_odds_ratio uses an Euler-only custom sampler; "
-                f"model.time_stepper={self.time_stepper!r} is not honored. "
-                f"Results will differ from sample() on this model.",
-                stacklevel=2,
             )
 
         sigma_schedule_fn = lambda t_hat: default_sigma_schedule(  # noqa: E731

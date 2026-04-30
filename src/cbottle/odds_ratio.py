@@ -445,7 +445,7 @@ def _edm_sampler_with_custom_steps(
     time_stepper=None,
 ):
     """Deterministic EDM sampler honoring an externally provided sigma schedule.
-
+    See Karras et al. 2022 for comparing this sampler (Euler) to EDM (2nd order/Heun).
     If ``progress_wrapper`` is set, the per-step iterable is passed through it
     once before iteration -- typically a tqdm wrapper for live progress, but
     callers can substitute any iterable-to-iterable transform.

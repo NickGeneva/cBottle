@@ -155,7 +155,10 @@ def test_calculate_odds_ratio_simple_wrapper():
     assert isinstance(log_odds_ratio, float) and math.isfinite(log_odds_ratio)
     assert forward_latents.shape == batch["target"].shape
 
-    with pytest.raises(ValueError):
+    # ``run_backward`` is not exposed on the simple wrapper -- it is fixed to
+    # True. Passing it through **kwargs collides with the wrapper's own
+    # forwarded value, which Python rejects with TypeError.
+    with pytest.raises(TypeError):
         model.calculate_odds_ratio(
             batch, guidance_pixels, num_steps=2, run_backward=False
         )
