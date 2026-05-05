@@ -24,7 +24,8 @@ import numpy as np
 import torch
 import earth2grid
 from earth2grid import healpix
-from typing import Literal
+from tqdm.auto import tqdm
+from typing import Callable, Literal, Sequence
 import dataclasses
 import logging
 from scipy.signal.windows import kaiser_bessel_derived
@@ -39,6 +40,15 @@ from cbottle.diffusion_samplers import (
     StackedRandomGenerator,
 )
 from cbottle.datasets import base
+from cbottle.odds_ratio import (
+    DivergenceTracker,
+    OddsRatioResult,
+    _make_reverse_aware_sampler,
+    calculate_divergence_integral,
+    calculate_gaussian_logp,
+    classifier_guidance,
+    default_sigma_schedule,
+)
 
 from cbottle.datasets.dataset_2d import HealpixDatasetV5, LABELS
 from cbottle.config import environment
@@ -114,7 +124,8 @@ class CBottle3d:
             time_stepper: Which time stepper to use (heun, euler)
             channels_last: Whether to convert input and model to channels_last
             torch_compile: Whether to compile the model with torch.compile
-            device: Device to move models to
+            device: Device to move models to. If None (default), auto-detects
+                "cuda" when available else "cpu".
         """
         self.net = net
         self.separate_classifier = separate_classifier
@@ -141,7 +152,7 @@ class CBottle3d:
 
     def _move_models_to_device(self, device: str | None):
         if device is None:
-            return
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.net = self.net.to(device)
         if self.separate_classifier is not None:
@@ -550,15 +561,40 @@ class CBottle3d:
         bf16=True,
         pre_generated_latents: torch.Tensor | None = None,
         return_untransformed: bool = False,
+        guidance_fn: Callable[
+            [
+                torch.Tensor | None,
+                torch.Tensor | None,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            torch.Tensor,
+        ]
+        | None = None,
+        sampler: Callable[..., torch.Tensor] | None = None,
     ):
         """
         Args:
-
-            guidance_pixels: Either the pixel index of ``self.input_grid``` where the
-                TCs are desired. 0<= guidance_pixels < 12 * nside ^2. Or the enitre HPX
-                tensor already set. If None, no guidance used.
-            guidance_scale: float = 0.03,
-
+            guidance_pixels: Either the pixel index of ``self.input_grid`` where
+                the TCs are desired (``0 <= guidance_pixels < 12 * nside ** 2``)
+                or the entire HPX tensor already set. If ``None``, no guidance.
+            guidance_scale: Multiplier on the per-step guidance vector returned
+                by ``guidance_fn``.
+            guidance_fn: Optional per-step guidance hook replacing
+                ``cbottle.denoiser_factories.get_guidance``. Called once per
+                sampler step with positional args
+                ``(guidance_data, logits, x_hat, denoised, t_hat)`` and must
+                return a ``torch.Tensor`` of the
+                same shape as ``x_hat`` representing the *unscaled* guidance
+                vector. The caller adds ``guidance_scale * d_guide`` to the
+                drift, so ``guidance_fn`` is responsible only for the gradient
+                direction and any sigma-schedule weighting it applies
+                internally.
+            sampler: Optional EDM sampler replacing ``edm_sampler_from_sigma``.
+                Called as ``sampler(D, xT, randn_like=..., sigma_min=...,
+                sigma_max=..., num_steps=..., time_stepper=...)`` and must
+                return a ``torch.Tensor`` of the same shape as ``xT``.
         """
         if batch["target"].device != self.device:
             batch = self._move_to_device(batch)
@@ -626,8 +662,21 @@ class CBottle3d:
                 if self.channels_last:
                     guidance_data = guidance_data.to(memory_format=torch.channels_last)
 
+            # Call the guidance hook whenever the caller supplied a guidance_fn
+            # (even if guidance_data is None and guidance_scale is 0) OR when we
+            # have classifier guidance data with positive scale (the original
+            # default path). A caller supplying only guidance_fn uses it purely
+            # for per-step inspection/tracking; its contribution to ``d`` is
+            # suppressed by the ``guidance_scale * d_guide`` multiplier.
+            _call_guidance = guidance_fn is not None or (
+                guidance_data is not None and guidance_scale > 0
+            )
+            _classifier_logits_needed = (
+                guidance_data is not None and guidance_scale > 0 and guidance_fn is None
+            )
+
             def D(x_hat, t_hat):
-                if guidance_data is not None:
+                if _call_guidance:
                     x_hat.requires_grad_(True)
 
                 out = self.net(
@@ -651,41 +700,50 @@ class CBottle3d:
                 else:
                     d2 = 0.0
                 d = out.out.where(mask, d2)
-                if guidance_data is not None and guidance_scale > 0:
-                    if self.separate_classifier is not None:
-                        out.logits = self.separate_classifier(
-                            x_hat,
-                            t_hat,
-                            class_labels=labels,
-                            condition=condition,
-                            second_of_day=second_of_day,
-                            day_of_year=day_of_year,
-                        ).logits
-                    elif out.logits is None:
-                        raise ValueError(
-                            "Model did not produce `logits`. Are you sure this model was trained with guidance?"
-                        )
-                    else:
-                        # use the logits from the main model
-                        pass
-                    d_guide = cbottle.denoiser_factories.get_guidance(
-                        guidance_data, out.logits, x_hat, d, t_hat
+                if _call_guidance:
+                    # Logits are only required when we'll be calling the default
+                    # classifier get_guidance (which needs them). Custom
+                    # guidance_fns can handle ``logits=None`` themselves.
+                    if guidance_data is not None and guidance_scale > 0:
+                        if self.separate_classifier is not None:
+                            out.logits = self.separate_classifier(
+                                x_hat,
+                                t_hat,
+                                class_labels=labels,
+                                condition=condition,
+                                second_of_day=second_of_day,
+                                day_of_year=day_of_year,
+                            ).logits
+                        elif out.logits is None and _classifier_logits_needed:
+                            raise ValueError(
+                                "Model did not produce `logits`. Are you sure this model was trained with guidance?"
+                            )
+                    # If the caller supplied guidance_fn, use it; else fall back to the
+                    # module-level get_guidance (still monkey-patchable for back-compat).
+                    _gfn = (
+                        guidance_fn
+                        if guidance_fn is not None
+                        else cbottle.denoiser_factories.get_guidance
                     )
-                    d = d + guidance_scale * d_guide
+                    d_guide = _gfn(guidance_data, out.logits, x_hat, d, t_hat)
+                    d = d + guidance_scale * d_guide  # zero-safe when guidance_scale=0
                     if self.channels_last:
                         d = d.to(memory_format=torch.channels_last)
 
                 return d
 
-            if guidance_data is not None:
+            if _call_guidance:
                 D = torch.enable_grad(D)
 
             D.round_sigma = self.net.round_sigma
             D.sigma_max = self.net.sigma_max
             D.sigma_min = self.net.sigma_min
 
+            # If the caller supplied a custom sampler, use it; else fall back to the
+            # module-level edm_sampler_from_sigma (still monkey-patchable for back-compat).
+            _sampler = sampler if sampler is not None else edm_sampler_from_sigma
             with torch.autocast("cuda", enabled=bf16, dtype=torch.bfloat16):
-                out = edm_sampler_from_sigma(
+                out = _sampler(
                     D,
                     xT,
                     randn_like=torch.randn_like,
@@ -709,6 +767,269 @@ class CBottle3d:
         return self.classifier_grid.ang2pix(
             torch.as_tensor(lons), torch.as_tensor(lats)
         )
+
+    def calculate_odds_ratio(
+        self,
+        batch: dict,
+        guidance_pixels: torch.Tensor,
+        **kwargs,
+    ) -> tuple[float, torch.Tensor]:
+        """Compute classifier-guided ``(log_odds_ratio, forward_latents)``.
+
+        Thin wrapper over :meth:`_calculate_odds_ratio_full`; ``**kwargs`` are
+        forwarded verbatim. The two backward phases always run -- without them
+        ``log_odds_ratio`` is undefined -- so callers who want forward-only
+        mode, the per-phase divergence integrals, the Gaussian logps, or the
+        backward latents should call :meth:`_calculate_odds_ratio_full`
+        directly.
+        """
+        result = self._calculate_odds_ratio_full(
+            batch, guidance_pixels, run_backward=True, **kwargs
+        )
+        return result.log_odds_ratio, result.forward_latents
+
+    def _calculate_odds_ratio_full(
+        self,
+        batch: dict[str, torch.Tensor],
+        guidance_pixels: torch.Tensor,
+        *,
+        num_steps: int = 36,
+        sigma_min: float = 0.002,
+        rho: float = 7.0,
+        extra_steps_intervals: "Sequence[tuple[float, float, int]]" = ((15, 20, 25),),
+        guidance_scale: float = 64.0 * 20.0,
+        guidance_on: float = 15.0,
+        guidance_off: float = 20.0,
+        divergence_samples: int = 3,
+        bf16: bool = True,
+        start_from_noisy_image: bool = False,
+        run_backward: bool = True,
+        forward_guidance: bool = True,
+        compute_forward_divergences: bool = True,
+        seed: int | None = None,
+    ) -> OddsRatioResult:
+        """Compute log-odds-ratio ingredients for ``batch`` under classifier guidance.
+
+        Phase naming follows the script convention, NOT standard diffusion
+        terminology:
+
+        - **"forward"** = decoding direction (``reverse=False``,
+          ``start_latents=None``). Standard EDM sampler: starts from Gaussian
+          noise at ``sigma_max`` and integrates down to ``sigma=0`` to produce
+          a clean sample (``forward_latents``).
+        - **"backward"** = encoding direction (``reverse=True``,
+          ``start_latents=forward_latents``). Schedule is flipped to ascend
+          from ``sigma_min`` to ``sigma_max``, with the tail restored to the
+          raw ``sigma_max`` so the Gaussian reference is well-defined. The
+          starting latents are overridden with ``forward_latents`` from the
+          forward phase, so the run encodes the forward sample back to noise
+          (``backward_latents`` / ``backward_no_guidance_latents``). The
+          Gaussian logp of these encoded noise tensors under
+          ``N(0, sigma_max^2 I)`` provides the reference for the odds ratio.
+
+        The ``log_odds_ratio`` property combines only the backward fields::
+
+            log p_unguided / p_guided
+            ~= (backward_no_guidance_gaussian_logp - backward_gaussian_logp)
+             + (backward_no_guidance_score_div_integral - backward_score_div_integral)
+             - backward_guidance_div_integral
+
+        For an unguided true log-likelihood via the probability-flow ODE use
+        :func:`cbottle.likelihood.log_prob` instead. Defaults match the TC
+        paper configuration (36 steps densified to 61 in the [15,20] sigma
+        window, ``guidance_scale = 64 * 20``). Note that the maximum sigma is
+        always ``self.sigma_max`` (the value the model was constructed with):
+        ``xT`` seeding, the schedule endpoint, and the Gaussian reference
+        logp must all agree, so it is not exposed as a kwarg here.
+
+        Args:
+            batch: Data batch (same format as :meth:`sample`).
+            guidance_pixels: 1-D tensor ``(N,)`` of HPX pixel indices on
+                ``self.classifier_grid`` (level 3, HEALPIX_PAD_XY) where TCs
+                are desired. Build via :meth:`get_guidance_pixels`.
+            num_steps, sigma_min, rho, extra_steps_intervals: Parameters of
+                the *custom* odds-ratio schedule built by
+                :func:`cbottle.odds_ratio._create_custom_time_steps`. These
+                are intentionally separate from ``self.num_steps`` /
+                ``self.sigma_min`` (which govern the default EDM sampler that
+                ``_sample_with_latents`` falls back on) and may be tuned
+                independently to densify the guidance window.
+            run_backward: If ``False``, only run the forward pass.
+            forward_guidance: If ``False``, forward pass runs without the
+                classifier guidance gradient.
+            compute_forward_divergences: If ``False``, skip Hutchinson probes
+                on the forward pass.
+            seed: If set, seeds the initial Gaussian noise for the forward
+                phase so the method is deterministic run-to-run. Hutchinson probes
+                are always deterministically seeded per step.
+
+        Returns:
+            :class:`~cbottle.odds_ratio.OddsRatioResult` with per-phase
+            divergence integrals, Gaussian reference logps, the forward
+            ``initial_log_prob``, and the raw untransformed phase latents.
+            Use ``result.log_odds_ratio`` to recover the combined scalar.
+
+        Note:
+            Only ``batch["target"].shape[0] == 1`` is supported. The
+            Hutchinson divergence trace and Gaussian reference logp are
+            both reduced as a single multivariate Gaussian over the whole
+            sample tensor, and the second-order autograd path through the
+            denoiser is GPU-memory-bound -- larger batches OOM in practice.
+        """
+
+        if batch["target"].shape[0] != 1:
+            raise ValueError(
+                f"_calculate_odds_ratio_full only supports batch_size=1; "
+                f"got batch['target'].shape={tuple(batch['target'].shape)}. "
+                f"Loop over batches in the caller."
+            )
+
+        sigma_schedule_fn = lambda t_hat: default_sigma_schedule(  # noqa: E731
+            t_hat, guidance_on=guidance_on, guidance_off=guidance_off
+        )
+
+        def _run_phase(
+            *,
+            reverse: bool,
+            compute_guidance: bool,
+            start_latents=None,
+            phase: str,
+            compute_divergences: bool = True,
+        ):
+            logging.info(
+                f"calculate_odds_ratio: running phase '{phase}' "
+                f"(reverse={reverse}, guidance={compute_guidance})"
+            )
+            if compute_guidance:
+                guidance_fn = classifier_guidance
+                guidance_pixels_eff = guidance_pixels
+                scale = guidance_scale
+                tracker_scale = guidance_scale
+            else:
+                guidance_fn = None
+                guidance_pixels_eff = None
+                scale = 0.0
+                # With no guidance_fn the scale is unused inside the tracker
+                # (it only multiplies a zero vector); pass 0 for clarity
+                # rather than the caller's scale.
+                tracker_scale = 0.0
+
+            tracker = DivergenceTracker(
+                guidance_fn=guidance_fn,
+                guidance_scale=tracker_scale,
+                sigma_max=self.sigma_max,
+                divergence_samples=divergence_samples,
+                phase=phase,
+                compute_score_div=compute_divergences,
+                compute_guidance_div=compute_divergences and compute_guidance,
+                sigma_schedule=sigma_schedule_fn,
+            )
+            sampler_func = _make_reverse_aware_sampler(
+                reverse=reverse,
+                start_latents=start_latents,
+                num_steps=num_steps,
+                sigma_min=sigma_min,
+                sigma_max=self.sigma_max,
+                rho=rho,
+                extra_steps_intervals=extra_steps_intervals,
+                progress_wrapper=lambda it, _phase=phase: tqdm(
+                    it,
+                    desc=f"calculate_odds_ratio[{_phase}]",
+                    leave=False,
+                ),
+            )
+
+            _processed, _coords, raw = self._sample_with_latents(
+                batch,
+                seed=seed,
+                start_from_noisy_image=start_from_noisy_image,
+                guidance_pixels=guidance_pixels_eff,
+                guidance_scale=scale,
+                bf16=bf16,
+                return_untransformed=True,
+                guidance_fn=tracker,
+                sampler=sampler_func,
+            )
+            return raw, tracker
+
+        # ---- Forward ---------------------------------------------------------
+        forward_phase = "forward" if forward_guidance else "forward_no_guidance"
+        forward_latents, forward_tracker = _run_phase(
+            reverse=False,
+            compute_guidance=forward_guidance,
+            start_latents=None,
+            phase=forward_phase,
+            compute_divergences=compute_forward_divergences,
+        )
+        forward_guidance_div_integral = calculate_divergence_integral(
+            forward_tracker.data, "divergence", "forward"
+        )
+        forward_score_div_integral = calculate_divergence_integral(
+            forward_tracker.data, "score_divergence", "forward"
+        )
+
+        result = OddsRatioResult(
+            forward_guidance_div_integral=float(forward_guidance_div_integral),
+            forward_score_div_integral=float(forward_score_div_integral),
+            initial_log_prob=forward_tracker.initial_log_prob,
+            forward_latents=forward_latents,
+        )
+
+        if not run_backward:
+            return result
+
+        # ---- Backward with guidance -----------------------------------------
+        backward_latents, backward_tracker = _run_phase(
+            reverse=True,
+            compute_guidance=True,
+            start_latents=forward_latents,
+            phase="backward",
+        )
+        backward_guidance_div_integral = calculate_divergence_integral(
+            backward_tracker.data, "divergence", "backward"
+        )
+        backward_score_div_integral = calculate_divergence_integral(
+            backward_tracker.data, "score_divergence", "backward"
+        )
+        backward_gaussian_logp = calculate_gaussian_logp(
+            backward_latents, self.sigma_max
+        )
+
+        # ---- Backward without guidance --------------------------------------
+        (
+            backward_no_guidance_latents,
+            backward_no_guidance_tracker,
+        ) = _run_phase(
+            reverse=True,
+            compute_guidance=False,
+            start_latents=forward_latents,
+            phase="backward_no_guidance",
+        )
+        backward_no_guidance_guidance_div_integral = calculate_divergence_integral(
+            backward_no_guidance_tracker.data, "divergence", "backward"
+        )
+        backward_no_guidance_score_div_integral = calculate_divergence_integral(
+            backward_no_guidance_tracker.data, "score_divergence", "backward"
+        )
+        backward_no_guidance_gaussian_logp = calculate_gaussian_logp(
+            backward_no_guidance_latents, self.sigma_max
+        )
+
+        result.backward_guidance_div_integral = float(backward_guidance_div_integral)
+        result.backward_score_div_integral = float(backward_score_div_integral)
+        result.backward_gaussian_logp = float(backward_gaussian_logp)
+        result.backward_latents = backward_latents
+        result.backward_no_guidance_guidance_div_integral = float(
+            backward_no_guidance_guidance_div_integral
+        )
+        result.backward_no_guidance_score_div_integral = float(
+            backward_no_guidance_score_div_integral
+        )
+        result.backward_no_guidance_gaussian_logp = float(
+            backward_no_guidance_gaussian_logp
+        )
+        result.backward_no_guidance_latents = backward_no_guidance_latents
+        return result
 
     def sample_for_superresolution(
         self,
