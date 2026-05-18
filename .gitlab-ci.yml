@@ -96,7 +96,7 @@ test:
     - make lint
     # TODO: training and inference tests should be split into different envs
     - python3 -m pip install earth2studio==0.13.0 pytest-regtest
-    - pip install --group training --group visualization -e .
+    - pip install -e .[training,visualization]
     - make pytest
     - pytest tests/integration -k 'not train_uncond'
     # TODO fix the scripts tests
